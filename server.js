@@ -1,64 +1,91 @@
 // server.js
-require("dotenv").config({ path: "C:/Users/HP/openai.env" });
+require("dotenv").config(); // Render will provide the variables automatically
 
 const express = require("express");
 const OpenAI = require("openai");
 const { MessagingResponse } = require("twilio").twiml;
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-// Important: parse Twilio form data
+// Initialize Supabase with Service Role Key (bypasses RLS for backend)
+const supabase = createClient(
+  process.env.SUPABASE_URL, 
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// Initialize OpenAI
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// Test route
-app.get("/", (req, res) => {
-  res.send("AI CRM running");
-});
-
-// WhatsApp webhook route
 app.post("/whatsapp", async (req, res) => {
   try {
     const incomingMsg = req.body.Body;
-    console.log("Received message from WhatsApp:", incomingMsg);
+    const businessNumber = req.body.To; // The WhatsApp number receiving the message
+    const customerNumber = req.body.From; // The customer's WhatsApp number
 
-    // OpenAI call
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    console.log(`Inquiry from ${customerNumber} to ${businessNumber}: ${incomingMsg}`);
 
+    // 1. Find which Client (User) owns this WhatsApp number
+    const { data: settings } = await supabase
+      .from('settings')
+      .select('user_id')
+      .eq('whatsapp_number', businessNumber)
+      .single();
+
+    if (!settings) {
+      console.error("No client found for number:", businessNumber);
+      return res.status(404).send("Number not registered in dashboard");
+    }
+
+    // 2. Fetch the Client's real-time product list from Supabase
+    const { data: products } = await supabase
+      .from('products')
+      .select('name, description, detail, moq, price, delivery_info')
+      .eq('user_id', settings.user_id);
+
+    // 3. Create the AI Context
+    const catalog = products.map(p => 
+      `Product: ${p.name}\nDesc: ${p.description}\nDetails: ${p.detail}\nPrice: $${p.price}\nMOQ: ${p.moq}\nDelivery: ${p.delivery_info}\n---`
+    ).join('\n');
+
+    // 4. Get AI Response
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
-          content:
-            "You are a sales assistant for a manufacturing company. Provide MOQ, pricing, and product details."
+          content: `You are a professional sales assistant. Answer based ONLY on this catalog:\n${catalog}`
         },
-        {
-          role: "user",
-          content: incomingMsg
-        }
+        { role: "user", content: incomingMsg }
       ]
     });
 
     const replyText = aiResponse.choices[0].message.content;
-    console.log("AI reply:", replyText);
 
-    // Respond to Twilio
+    // 5. Log the Lead back to the Dashboard
+    await supabase.from('leads').insert([{
+      customer_phone: customerNumber,
+      customer_name: "WhatsApp User",
+      inquiry_text: incomingMsg,
+      ai_reply: replyText,
+      user_id: settings.user_id,
+      status: 'Inquiry'
+    }]);
+
+    // 6. Send TwiML response to Twilio
     const twiml = new MessagingResponse();
     twiml.message(replyText);
-
     res.writeHead(200, { "Content-Type": "text/xml" });
     res.end(twiml.toString());
 
   } catch (error) {
-    console.error(error);
-    res.status(500).send("Error generating response");
+    console.error("Critical Error:", error);
+    res.status(500).send("Error");
   }
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
-});
+app.listen(PORT, () => console.log(`Server active on port ${PORT}`));
