@@ -27,7 +27,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// ✅ NUMBER NORMALIZER (VERY IMPORTANT)
+// ✅ NUMBER NORMALIZER
 const normalizeNumber = (num) =>
   num ? num.replace("whatsapp:", "").replace(/\D/g, "") : "";
 
@@ -47,12 +47,54 @@ app.get("/test-supabase", async (req, res) => {
   }
 });
 
+
+// 🚀🚀🚀 MAIN FIX: SAVE WHATSAPP ROUTE 🚀🚀🚀
+app.post("/save-whatsapp", async (req, res) => {
+  try {
+    console.log("🔥 /save-whatsapp HIT");
+
+    const { user_id, whatsapp_number } = req.body;
+
+    if (!user_id || !whatsapp_number) {
+      return res.status(400).json({ error: "Missing user_id or whatsapp_number" });
+    }
+
+    const cleanNumber = normalizeNumber(whatsapp_number);
+
+    const { data, error } = await supabase
+      .from("settings")
+      .upsert(
+        [
+          {
+            user_id,
+            whatsapp_number: cleanNumber,
+            updated_at: new Date().toISOString(),
+          },
+        ],
+        { onConflict: "user_id" }
+      );
+
+    if (error) throw error;
+
+    console.log("✅ WhatsApp saved:", cleanNumber);
+
+    return res.json({
+      success: true,
+      message: "WhatsApp number saved successfully",
+      data,
+    });
+  } catch (err) {
+    console.error("❌ SAVE ERROR:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
 // ✅ WHATSAPP WEBHOOK
 app.post("/whatsapp", async (req, res) => {
   const twiml = new MessagingResponse();
 
   try {
-    // ✅ VALIDATE PAYLOAD
     if (!req.body.Body || !req.body.To || !req.body.From) {
       console.error("❌ Invalid Twilio payload");
       return res.status(400).send("Invalid request");
@@ -67,106 +109,72 @@ app.post("/whatsapp", async (req, res) => {
     console.log("To:", businessNumber);
     console.log("Message:", incomingMsg);
 
-    // ✅ FETCH ALL SETTINGS (ROBUST MATCHING)
-    const { data: allSettings, error: settingsError } = await supabase
+    // ✅ FIND USER
+    const { data: settingsList, error: settingsError } = await supabase
       .from("settings")
       .select("user_id, whatsapp_number");
 
     if (settingsError) throw settingsError;
 
-    const settings = allSettings?.find(
+    const settings = settingsList?.find(
       (s) => normalizeNumber(s.whatsapp_number) === businessNumber
     );
 
     if (!settings) {
-      console.error("❌ No matching user for number:", businessNumber);
+      console.error("❌ No matching user");
       twiml.message("Sorry, this business is not currently active.");
       return res.type("text/xml").send(twiml.toString());
     }
 
     // ✅ FETCH PRODUCTS
-    const { data: products, error: prodError } = await supabase
+    const { data: products } = await supabase
       .from("products")
-      .select("name, description, detail, moq, price, delivery_info")
+      .select("*")
       .eq("user_id", settings.user_id);
 
-    if (prodError) console.error("❌ Product Fetch Error:", prodError.message);
-
-    const productList = products || [];
-
-    if (productList.length === 0) {
-      console.log("⚠️ No products found for this user");
-    }
-
     const catalog =
-      productList.length > 0
-        ? productList
+      products?.length > 0
+        ? products
             .map(
               (p) =>
-                `Product: ${p.name} | Price: $${p.price} | MOQ: ${p.moq} | Delivery: ${p.delivery_info}`
+                `Product: ${p.name} | Price: $${p.price} | MOQ: ${p.moq}`
             )
             .join("\n")
-        : "No products currently available.";
+        : "No products available.";
 
-    console.log(
-      `[Context] Found ${productList.length} products for User: ${settings.user_id}`
-    );
-
-    // ✅ AI RESPONSE WITH TIMEOUT
-    const aiResponse = await Promise.race([
-      openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are a professional WhatsApp sales assistant.
-
-Rules:
-- Be short, clear, and persuasive
-- Help the customer choose a product
-- If product exists → recommend it
-- If no products → ask for customer details (name, requirement)
-
-Catalog:
-${catalog}`,
-          },
-          { role: "user", content: incomingMsg },
-        ],
-      }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("AI Timeout")), 8000)
-      ),
-    ]);
+    // ✅ AI RESPONSE
+    const aiResponse = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You are a sales assistant. Use this catalog:\n${catalog}`,
+        },
+        { role: "user", content: incomingMsg },
+      ],
+    });
 
     const replyText =
       aiResponse?.choices?.[0]?.message?.content ||
-      "Sorry, I couldn't generate a response.";
+      "Sorry, something went wrong.";
 
-    // ✅ LOG LEAD (ASYNC)
-    supabase
-      .from("leads")
-      .insert([
-        {
-          customer_phone: customerNumber,
-          inquiry_text: incomingMsg,
-          ai_reply: replyText,
-          user_id: settings.user_id,
-          status: "Inquiry",
-        },
-      ])
-      .then(({ error }) => {
-        if (error) console.error("❌ Lead Log Error:", error.message);
-      });
+    // ✅ LOG LEAD
+    await supabase.from("leads").insert([
+      {
+        customer_phone: customerNumber,
+        inquiry_text: incomingMsg,
+        ai_reply: replyText,
+        user_id: settings.user_id,
+        status: "Inquiry",
+      },
+    ]);
 
-    // ✅ SEND RESPONSE
     twiml.message(replyText);
     res.type("text/xml").send(twiml.toString());
-  } catch (error) {
-    console.error("🔥 Critical Error:", error);
 
-    twiml.message(
-      "I'm having a technical moment. Please try again in a minute."
-    );
+  } catch (error) {
+    console.error("🔥 ERROR:", error);
+    twiml.message("Server error. Try again later.");
     res.type("text/xml").send(twiml.toString());
   }
 });
@@ -174,5 +182,5 @@ ${catalog}`,
 // ✅ START SERVER
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () =>
-  console.log(`🚀 Server active on port ${PORT}`)
+  console.log(`🚀 Server running on port ${PORT}`)
 );
