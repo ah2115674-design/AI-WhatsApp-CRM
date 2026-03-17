@@ -1,4 +1,3 @@
-// server.js
 require("dotenv").config();
 
 const express = require("express");
@@ -8,7 +7,7 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
-// 1️⃣ Check Environment Variables
+// ✅ ENV CHECK
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ MISSING SUPABASE ENV VARIABLES");
 }
@@ -16,7 +15,7 @@ if (!process.env.OPENAI_API_KEY) {
   console.error("❌ MISSING OPENAI API KEY");
 }
 
-// 2️⃣ Initialize Supabase & OpenAI
+// ✅ INIT
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -24,16 +23,20 @@ const supabase = createClient(
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// 3️⃣ Middleware
+// ✅ MIDDLEWARE
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// 4️⃣ Root route (basic ping)
+// ✅ NUMBER NORMALIZER (VERY IMPORTANT)
+const normalizeNumber = (num) =>
+  num ? num.replace("whatsapp:", "").replace(/\D/g, "") : "";
+
+// ✅ ROOT
 app.get("/", (req, res) => {
   res.send("Server is alive ✅");
 });
 
-// 5️⃣ Test Supabase route
+// ✅ TEST SUPABASE
 app.get("/test-supabase", async (req, res) => {
   try {
     const { data, error } = await supabase.from("settings").select("*").limit(1);
@@ -44,32 +47,44 @@ app.get("/test-supabase", async (req, res) => {
   }
 });
 
-// 6️⃣ Twilio WhatsApp webhook
+// ✅ WHATSAPP WEBHOOK
 app.post("/whatsapp", async (req, res) => {
   const twiml = new MessagingResponse();
 
   try {
-    const incomingMsg = req.body.Body;
-    const businessNumber = req.body.To.replace("whatsapp:", "").replace("+", "");
-    const customerNumber = req.body.From;
+    // ✅ VALIDATE PAYLOAD
+    if (!req.body.Body || !req.body.To || !req.body.From) {
+      console.error("❌ Invalid Twilio payload");
+      return res.status(400).send("Invalid request");
+    }
 
-    console.log(`[Incoming] From: ${customerNumber} To: ${businessNumber}`);
+    const incomingMsg = req.body.Body;
+    const businessNumber = normalizeNumber(req.body.To);
+    const customerNumber = normalizeNumber(req.body.From);
+
+    console.log("------ NEW MESSAGE ------");
+    console.log("From:", customerNumber);
+    console.log("To:", businessNumber);
     console.log("Message:", incomingMsg);
 
-    // 6a. Lookup client settings
-    const { data: settings, error: settingsError } = await supabase
+    // ✅ FETCH ALL SETTINGS (ROBUST MATCHING)
+    const { data: allSettings, error: settingsError } = await supabase
       .from("settings")
-      .select("user_id, whatsapp_number")
-      .or(`whatsapp_number.eq.${businessNumber},whatsapp_number.eq.+${businessNumber}`)
-      .single();
+      .select("user_id, whatsapp_number");
 
-    if (settingsError || !settings) {
-      console.error("❌ Lookup Failed:", settingsError?.message || "Number not found");
+    if (settingsError) throw settingsError;
+
+    const settings = allSettings?.find(
+      (s) => normalizeNumber(s.whatsapp_number) === businessNumber
+    );
+
+    if (!settings) {
+      console.error("❌ No matching user for number:", businessNumber);
       twiml.message("Sorry, this business is not currently active.");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // 6b. Fetch client products
+    // ✅ FETCH PRODUCTS
     const { data: products, error: prodError } = await supabase
       .from("products")
       .select("name, description, detail, moq, price, delivery_info")
@@ -78,6 +93,11 @@ app.post("/whatsapp", async (req, res) => {
     if (prodError) console.error("❌ Product Fetch Error:", prodError.message);
 
     const productList = products || [];
+
+    if (productList.length === 0) {
+      console.log("⚠️ No products found for this user");
+    }
+
     const catalog =
       productList.length > 0
         ? productList
@@ -88,27 +108,41 @@ app.post("/whatsapp", async (req, res) => {
             .join("\n")
         : "No products currently available.";
 
-    console.log(`[Context] Found ${productList.length} products for User: ${settings.user_id}`);
+    console.log(
+      `[Context] Found ${productList.length} products for User: ${settings.user_id}`
+    );
 
-    // 6c. Generate AI response
-    const aiResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `You are a professional sales assistant. ${
-            productList.length === 0
-              ? "We are currently updating our catalog. Ask for customer details."
-              : "Answer based ONLY on this catalog:\n" + catalog
-          }`,
-        },
-        { role: "user", content: incomingMsg },
-      ],
-    });
+    // ✅ AI RESPONSE WITH TIMEOUT
+    const aiResponse = await Promise.race([
+      openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `You are a professional WhatsApp sales assistant.
 
-    const replyText = aiResponse?.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
+Rules:
+- Be short, clear, and persuasive
+- Help the customer choose a product
+- If product exists → recommend it
+- If no products → ask for customer details (name, requirement)
 
-    // 6d. Log lead asynchronously
+Catalog:
+${catalog}`,
+          },
+          { role: "user", content: incomingMsg },
+        ],
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("AI Timeout")), 8000)
+      ),
+    ]);
+
+    const replyText =
+      aiResponse?.choices?.[0]?.message?.content ||
+      "Sorry, I couldn't generate a response.";
+
+    // ✅ LOG LEAD (ASYNC)
     supabase
       .from("leads")
       .insert([
@@ -124,16 +158,21 @@ app.post("/whatsapp", async (req, res) => {
         if (error) console.error("❌ Lead Log Error:", error.message);
       });
 
-    // 6e. Send Twilio reply
+    // ✅ SEND RESPONSE
     twiml.message(replyText);
     res.type("text/xml").send(twiml.toString());
   } catch (error) {
     console.error("🔥 Critical Error:", error);
-    twiml.message("I'm having a technical moment. Please try again in a minute.");
+
+    twiml.message(
+      "I'm having a technical moment. Please try again in a minute."
+    );
     res.type("text/xml").send(twiml.toString());
   }
 });
 
-// 7️⃣ Start server
+// ✅ START SERVER
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server active on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`🚀 Server active on port ${PORT}`)
+);
