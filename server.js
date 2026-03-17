@@ -1,11 +1,19 @@
 require("dotenv").config();
 
 const express = require("express");
+const cors = require("cors");
 const OpenAI = require("openai");
 const { MessagingResponse } = require("twilio").twiml;
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+
+// ✅ CORS - allow requests from your frontend
+app.use(cors({
+  origin: "*", // in production, replace "*" with your frontend URL
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type"]
+}));
 
 // ✅ ENV CHECK
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
@@ -20,7 +28,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ✅ MIDDLEWARE
@@ -32,9 +39,7 @@ const normalizeNumber = (num) =>
   num ? num.replace("whatsapp:", "").replace(/\D/g, "") : "";
 
 // ✅ ROOT
-app.get("/", (req, res) => {
-  res.send("Server is alive ✅");
-});
+app.get("/", (req, res) => res.send("Server is alive ✅"));
 
 // ✅ TEST SUPABASE
 app.get("/test-supabase", async (req, res) => {
@@ -47,12 +52,9 @@ app.get("/test-supabase", async (req, res) => {
   }
 });
 
-
-// 🚀🚀🚀 MAIN FIX: SAVE WHATSAPP ROUTE 🚀🚀🚀
+// 🚀 SAVE WHATSAPP NUMBER
 app.post("/save-whatsapp", async (req, res) => {
   try {
-    console.log("🔥 /save-whatsapp HIT");
-
     const { user_id, whatsapp_number } = req.body;
 
     if (!user_id || !whatsapp_number) {
@@ -64,13 +66,7 @@ app.post("/save-whatsapp", async (req, res) => {
     const { data, error } = await supabase
       .from("settings")
       .upsert(
-        [
-          {
-            user_id,
-            whatsapp_number: cleanNumber,
-            updated_at: new Date().toISOString(),
-          },
-        ],
+        [{ user_id, whatsapp_number: cleanNumber, updated_at: new Date().toISOString() }],
         { onConflict: "user_id" }
       );
 
@@ -78,17 +74,17 @@ app.post("/save-whatsapp", async (req, res) => {
 
     console.log("✅ WhatsApp saved:", cleanNumber);
 
-    return res.json({
+    res.json({
       success: true,
       message: "WhatsApp number saved successfully",
       data,
     });
+
   } catch (err) {
     console.error("❌ SAVE ERROR:", err);
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
-
 
 // ✅ WHATSAPP WEBHOOK
 app.post("/whatsapp", async (req, res) => {
@@ -96,37 +92,28 @@ app.post("/whatsapp", async (req, res) => {
 
   try {
     if (!req.body.Body || !req.body.To || !req.body.From) {
-      console.error("❌ Invalid Twilio payload");
-      return res.status(400).send("Invalid request");
+      return res.status(400).send("Invalid Twilio payload");
     }
 
     const incomingMsg = req.body.Body;
     const businessNumber = normalizeNumber(req.body.To);
     const customerNumber = normalizeNumber(req.body.From);
 
-    console.log("------ NEW MESSAGE ------");
-    console.log("From:", customerNumber);
-    console.log("To:", businessNumber);
-    console.log("Message:", incomingMsg);
-
-    // ✅ FIND USER
-    const { data: settingsList, error: settingsError } = await supabase
+    // FIND USER
+    const { data: settingsList } = await supabase
       .from("settings")
       .select("user_id, whatsapp_number");
-
-    if (settingsError) throw settingsError;
 
     const settings = settingsList?.find(
       (s) => normalizeNumber(s.whatsapp_number) === businessNumber
     );
 
     if (!settings) {
-      console.error("❌ No matching user");
       twiml.message("Sorry, this business is not currently active.");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // ✅ FETCH PRODUCTS
+    // FETCH PRODUCTS
     const { data: products } = await supabase
       .from("products")
       .select("*")
@@ -134,31 +121,21 @@ app.post("/whatsapp", async (req, res) => {
 
     const catalog =
       products?.length > 0
-        ? products
-            .map(
-              (p) =>
-                `Product: ${p.name} | Price: $${p.price} | MOQ: ${p.moq}`
-            )
-            .join("\n")
+        ? products.map(p => `Product: ${p.name} | Price: $${p.price} | MOQ: ${p.moq}`).join("\n")
         : "No products available.";
 
-    // ✅ AI RESPONSE
+    // AI RESPONSE
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        {
-          role: "system",
-          content: `You are a sales assistant. Use this catalog:\n${catalog}`,
-        },
+        { role: "system", content: `You are a sales assistant. Catalog:\n${catalog}` },
         { role: "user", content: incomingMsg },
       ],
     });
 
-    const replyText =
-      aiResponse?.choices?.[0]?.message?.content ||
-      "Sorry, something went wrong.";
+    const replyText = aiResponse?.choices?.[0]?.message?.content || "Sorry, something went wrong.";
 
-    // ✅ LOG LEAD
+    // LOG LEAD
     await supabase.from("leads").insert([
       {
         customer_phone: customerNumber,
@@ -181,6 +158,4 @@ app.post("/whatsapp", async (req, res) => {
 
 // ✅ START SERVER
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () =>
-  console.log(`🚀 Server running on port ${PORT}`)
-);
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on port ${PORT}`));
