@@ -8,9 +8,9 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
-// ✅ CORS - allow requests from your frontend
+// ✅ CORS
 app.use(cors({
-  origin: "*", // in production, replace "*" with your frontend URL
+  origin: "*",
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type"]
 }));
@@ -52,6 +52,71 @@ app.get("/test-supabase", async (req, res) => {
   }
 });
 
+// 🔥 AI CORE FUNCTION
+async function generateAIResponse(userMessage, user_id, customerNumber) {
+  // 1. Fetch products
+  const { data: products } = await supabase
+    .from("products")
+    .select("*")
+    .eq("user_id", user_id);
+
+  // 2. Fetch last 5 messages
+  const { data: history } = await supabase
+    .from("leads")
+    .select("inquiry_text, ai_reply")
+    .eq("customer_phone", customerNumber)
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  const formattedHistory = history
+    ?.reverse()
+    .map(h => `User: ${h.inquiry_text}\nAI: ${h.ai_reply}`)
+    .join("\n");
+
+  // 3. Structured catalog
+  const catalog = products?.length
+    ? products.map(p => ({
+        name: p.name,
+        price: p.price,
+        moq: p.moq,
+        description: p.description
+      }))
+    : [];
+
+  // 4. Prompt for OpenAI
+  const prompt = `
+You are a professional WhatsApp sales agent.
+
+Goals:
+- Answer product questions clearly
+- Suggest relevant products
+- Be short, friendly, human
+- Encourage buying
+
+Products:
+${JSON.stringify(catalog)}
+
+Conversation history:
+${formattedHistory || "No previous conversation"}
+
+User message:
+${userMessage}
+
+Rules:
+- ONLY use product data
+- If product not found, say: "Let me check that for you"
+- Keep replies under 3 lines
+`;
+
+  // 5. OpenAI call
+  const aiResponse = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  return aiResponse?.choices?.[0]?.message?.content || "Sorry, something went wrong.";
+}
+
 // 🚀 SAVE WHATSAPP NUMBER
 app.post("/save-whatsapp", async (req, res) => {
   try {
@@ -74,11 +139,7 @@ app.post("/save-whatsapp", async (req, res) => {
 
     console.log("✅ WhatsApp saved:", cleanNumber);
 
-    res.json({
-      success: true,
-      message: "WhatsApp number saved successfully",
-      data,
-    });
+    res.json({ success: true, message: "WhatsApp number saved successfully", data });
 
   } catch (err) {
     console.error("❌ SAVE ERROR:", err);
@@ -87,7 +148,7 @@ app.post("/save-whatsapp", async (req, res) => {
 });
 
 // ✅ WHATSAPP WEBHOOK
-app.post("/whatsapp", async (req, res) => {
+app.post("/api/webhook", async (req, res) => {
   const twiml = new MessagingResponse();
 
   try {
@@ -113,27 +174,12 @@ app.post("/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // FETCH PRODUCTS
-    const { data: products } = await supabase
-      .from("products")
-      .select("*")
-      .eq("user_id", settings.user_id);
-
-    const catalog =
-      products?.length > 0
-        ? products.map(p => `Product: ${p.name} | Price: $${p.price} | MOQ: ${p.moq}`).join("\n")
-        : "No products available.";
-
     // AI RESPONSE
-    const aiResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: `You are a sales assistant. Catalog:\n${catalog}` },
-        { role: "user", content: incomingMsg },
-      ],
-    });
-
-    const replyText = aiResponse?.choices?.[0]?.message?.content || "Sorry, something went wrong.";
+    const replyText = await generateAIResponse(
+      incomingMsg,
+      settings.user_id,
+      customerNumber
+    );
 
     // LOG LEAD
     await supabase.from("leads").insert([
@@ -143,6 +189,7 @@ app.post("/whatsapp", async (req, res) => {
         ai_reply: replyText,
         user_id: settings.user_id,
         status: "Inquiry",
+        created_at: new Date().toISOString()
       },
     ]);
 
@@ -151,8 +198,19 @@ app.post("/whatsapp", async (req, res) => {
 
   } catch (error) {
     console.error("🔥 ERROR:", error);
-    twiml.message("Server error. Try again later.");
+    twiml.message("Something went wrong. Please try again in a moment.");
     res.type("text/xml").send(twiml.toString());
+  }
+});
+
+// ✅ DASHBOARD / TEST ENDPOINT
+app.post("/api/whatsapp/test", async (req, res) => {
+  try {
+    const { message, user_id } = req.body;
+    const reply = await generateAIResponse(message, user_id, "test-user");
+    res.json({ reply });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
